@@ -1,0 +1,5 @@
+aiwolf-nlp-agent/.venv/
+aiwolf-nlp-server/aiwolf-nlp-server
+.DS_Store
+__pycache__/
+*.pyc
