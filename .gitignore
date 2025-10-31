@@ -3,3 +3,12 @@ aiwolf-nlp-server/aiwolf-nlp-server
 .DS_Store
 __pycache__/
 *.pyc
+
+# AIWolf Server (実行ファイルとローカル設定)
+aiwolf-nlp-server/aiwolf-nlp-server-*
+aiwolf-nlp-server/default_*.yml
+aiwolf-nlp-server/.env
+
+# AIWolf Agent (ローカル設定とログ)
+aiwolf-nlp-agent/config/config.yml
+aiwolf-nlp-agent/logs/
