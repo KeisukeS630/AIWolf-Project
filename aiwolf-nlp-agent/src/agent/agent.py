@@ -53,6 +53,8 @@ class Agent:
         self.talk_history: list[Talk] = []
         self.whisper_history: list[Talk] = []
         self.role = role
+        #占い師をCOした人のリスト
+        
 
         self.comments: list[str] = []
         with Path.open(
