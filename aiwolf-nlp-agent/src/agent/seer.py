@@ -57,31 +57,40 @@ class Seer(Agent):
                     self.werewolves.append(target)
 
     def talk(self) -> str:
+        # self.info が None でないか念のため確認 (安全策)251107
+        if self.info is None:
+            self.agent_logger.logger.warning("self.info が None のため、super().talk() を呼びます。")
+            return super().talk()
+
         # 1. 1日目、かつ、まだCOしていない場合251030
         if self.info.day == 1 and not self.has_co:
             self.has_co = True  # COしたことを記憶する251030
-            co_text = f"私は占い師です。"#--英語が正解？--251106
+            
+            # ▼▼▼ デバッグログ追加 ▼▼▼251107
+            # self.info.agent の中身をログに出力する
+            agent_name_to_co = self.info.agent
+            self.agent_logger.logger.info(f"COに使用する名前: '{agent_name_to_co}' (型: {type(agent_name_to_co)})")
+            # ▲▲▲ デバッグログ追加 ▲▲▲
+
+            co_text = f"COMINGOUT {agent_name_to_co} SEER" #--英語が正解？--251106 #英語に修正、自分の名前を言うように修正251107
             self.agent_logger.logger.info(f"Day 1なのでCOします: {co_text}")
             return co_text
         
         # 2. 占い結果の報告処理251106
-        # 自分の「記憶」(my_divination_results)をすべてチェック251106
         for day, result in self.my_divination_results.items():
-            
-            # 「その日の結果(day)」が「報告済みリスト(reported_days)」にまだ入っていないか？251106
             if day not in self.reported_days:
-                
-                # まだ報告していない新情報なので、報告する251106
-                report_text = f"{result.target}を占って{result.result.value}と出ました。"#--英語が正解？--251106
+                report_text = f"DIVINED {result.target} {result.result.value}" 
                 self.agent_logger.logger.info(f"新しい占い結果を報告します: {report_text}")
-                
-                # 報告したので、忘れないように「報告済みリスト」に追加する251106
                 self.reported_days.append(day)
-                
-                # 発言を返して、このターンのtalk()処理を終了251106
                 return report_text
         
         # 3. デフォルトの発言処理
+        # ▼▼▼ デバッグログ追加 ▼▼▼251107
+        self.agent_logger.logger.info("COも占い報告もせず、super().talk() を呼びます。")
+        if not self.comments: # self.comments が空かどうかもチェック
+             self.agent_logger.logger.warning("self.comments が空です！ random_talk のファイルを確認してください。")
+        # ▲▲▲ デバッグログ追加 ▲▲▲
+        
         return super().talk()
 
     def divine(self) -> str:
@@ -95,7 +104,10 @@ class Seer(Agent):
         # (生きている AND 自分ではない AND まだ占っていない)2511106
         candidates = [
             agent for agent in alive_agents 
-            if agent != self.agent_name and agent not in divined_agents
+            
+            # ▼▼▼ 修正箇所 1 ▼▼▼
+            if agent != self.info.agent and agent not in divined_agents
+            # ▲▲▲ 修正箇所 1 ▲▲▲
         ]
 
         # 候補者がいれば、その中からランダムで選ぶ2511106
@@ -105,11 +117,84 @@ class Seer(Agent):
             return target
             
         # 候補者がいない場合（全員占ってしまった場合など）は、自分以外の生存者からランダム2511106
-        fallback_candidates = [agent for agent in alive_agents if agent != self.agent_name]
+        
+        # ▼▼▼ 修正箇所 2 ▼▼▼
+        fallback_candidates = [agent for agent in alive_agents if agent != self.info.agent]
+        # ▲▲▲ 修正箇所 2 ▲▲▲
+        
         if fallback_candidates:
             return random.choice(fallback_candidates) # type: ignore 2511106
         
         return super().divine()
 
-    def vote(self) -> str:
-        return super().vote()
+    def vote(self) -> str: #251107
+        """Return response to vote request.
+
+        投票リクエストに対する応答を返す.
+
+        Returns:
+            str: Agent name to vote / 投票対象のエージェント名
+        """
+        # --- 意思決定の前に、最新の情報を解析する ---
+        self._update_game_state()
+
+        # 1. 自分が占って「黒（WEREWOLF）」だったエージェントのリスト
+        # ▼▼▼ 修正箇所 (Role -> Species) ▼▼▼
+        my_black_list = {
+            result.target for result in self.my_divination_results.values() 
+            if result.result == Species.WEREWOLF 
+        }
+        # ▲▲▲ 修正箇所 ▲▲▲
+        
+        # 2. 他の人が「黒（WEREWOLF）」と報告したエージェントのリスト
+        other_black_list = self.divined_as_black
+
+        # 3. 生存者リスト
+        alive_agents = self.get_alive_agents()
+        my_name = self.info.agent # (self.info.agent が安全)
+
+        # 4. 投票候補者リスト（黒判定された生存者）
+        candidates = []
+        for agent in alive_agents:
+            if agent in my_black_list or agent in other_black_list:
+                if agent != my_name:
+                    candidates.append(agent)
+        
+        # 5. 黒判定の人がいれば、その人に投票
+        if candidates:
+            target = random.choice(candidates) # type: ignore
+            self.agent_logger.logger.info(f"黒判定リスト {candidates} から {target} に投票します。")
+            return target
+        
+        # ▼▼▼ 修正箇所 (グレー投票ロジックの追加) ▼▼▼
+        # 6. 黒判定の人がいない場合、グレーの人（自分が白出ししていない人）に投票
+        
+        # 自分が白出しした人のリスト
+        my_white_list = {
+            result.target for result in self.my_divination_results.values()
+            if result.result == Species.HUMAN
+        }
+        
+        # グレーリスト (生存者 AND 自分以外 AND 自分が白出ししていない)
+        gray_list = [
+            agent for agent in alive_agents
+            if agent != my_name and agent not in my_white_list
+        ]
+        
+        if gray_list:
+            target = random.choice(gray_list) # type: ignore
+            self.agent_logger.logger.info(f"黒判定者がいないため、グレーリスト {gray_list} (自分が白判定していない) から {target} に投票します。")
+            return target
+
+        # 7. グレーの人もいない場合（＝自分以外の生存者全員を白判定した場合）
+        # 自分以外の生存者からランダムに選ぶ（白判定した人に投票せざるを得ない）
+        fallback_candidates = [agent for agent in alive_agents if agent != my_name]
+        if fallback_candidates:
+            target = random.choice(fallback_candidates) # type: ignore
+            self.agent_logger.logger.info(f"黒もグレーもいないため、自分以外の生存者 {fallback_candidates} から {target} に投票します。")
+            return target
+        # ▲▲▲ 修正箇所 ▲▲▲
+
+        # 8. (万が一) 自分しかいない場合は自分に投票
+        self.agent_logger.logger.warning("投票候補が自分しかいません。")
+        return my_name

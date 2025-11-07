@@ -56,6 +56,7 @@ cp config/config.yml.example config/config.yml
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
+pip install typing_extensions
 ```
 
 > [!NOTE]

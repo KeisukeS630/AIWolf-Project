@@ -9,7 +9,7 @@ import random
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
-from aiwolf_nlp_common.packet import Info, Packet, Request, Role, Setting, Status, Talk
+from aiwolf_nlp_common.packet import Info, Packet, Request, Role, Setting, Status, Talk, Species
 
 from utils.agent_logger import AgentLogger
 from utils.stoppable_thread import StoppableThread
@@ -53,15 +53,61 @@ class Agent:
         self.talk_history: list[Talk] = []
         self.whisper_history: list[Talk] = []
         self.role = role
-        #占い師をCOした人のリスト
-        
 
+        # ▼▼▼ 以下のブロックを差し替え ▼▼▼251107
+        
         self.comments: list[str] = []
-        with Path.open(
-            Path(str(self.config["path"]["random_talk"])),
-            encoding="utf-8",
-        ) as f:
-            self.comments = f.read().splitlines()
+        # configからファイルパスを取得
+        file_path_str = str(self.config["path"]["random_talk"])
+        file_path = Path(file_path_str)
+
+        try:
+            # pathlib を使ってファイルを開く
+            with file_path.open(encoding="utf-8") as f:
+                content = f.read()
+                self.comments = content.splitlines()
+
+            # 読み込み結果をログに出力
+            if not self.comments:
+                # ファイルは存在したが、中身が空だった場合
+                self.agent_logger.logger.warning(f"__init__: ランダム発話ファイルは見つかりましたが、中身が空です: {file_path_str}")
+            else:
+                # 成功
+                self.agent_logger.logger.info(f"__init__: {len(self.comments)}行のランダム発話を読み込みました。 (例: {self.comments[0]})")
+
+        except FileNotFoundError:
+            # ファイル自体が見つからなかった場合
+            self.agent_logger.logger.error(f"__init__: ランダム発話ファイルが見つかりません！")
+            self.agent_logger.logger.error(f"__init__: 実行パス: {Path.cwd()}")
+            self.agent_logger.logger.error(f"__init__: 探したパス: {file_path.absolute()}")
+        except Exception as e:
+            # その他のエラー（パーミッションなど）
+            self.agent_logger.logger.error(f"__init__: ランダム発話ファイルの読み込み中に予期せぬエラー: {e}")
+        
+        # ▲▲▲ 差し替えここまで ▲▲▲
+
+        # --- ★追加★ 戦略のためのゲーム状態変数 ---251107
+        
+        # 議論のターン（何番目の発言まで読んだか）
+        self.talk_turn: int = 0
+        
+        # 投票宣言 {発言者: 投票先} (毎日リセット)
+        self.vote_declarations: dict[str, str] = {}
+        
+        # --- 永続的な情報（CO、占い結果）---
+        # これらは daily_initialize でリセット *しない*
+        
+        # ★要求1: COした占い師のリスト (Setで重複なし)
+        self.seer_co_agents: set[str] = set()
+        
+        # ★要求2: 占われて黒だった人のリスト (Setで重複なし)
+        self.divined_as_black: set[str] = set()
+
+        # ★要求3: 占われて白だった人のリスト (Setで重複なし)
+        self.divined_as_white: set[str] = set()
+        
+        # (参考) より詳細な占い・霊媒の結果報告リスト (報告者, 対象, 役職)
+        self.divined_reports: list[tuple[str, str, Role | Species]] = []
 
     @staticmethod
     def timeout(func: Callable[P, T]) -> Callable[P, T]:
@@ -166,8 +212,102 @@ class Agent:
     def daily_initialize(self) -> None:
         """Perform processing for daily initialization request.
 
-        昼開始リクエストに対する処理を行う.
+        昼開始リクエスト (毎朝)。
+        毎日の揮発性情報(発言ターン、投票先宣言)をリセットし、
+        議論開始前にゲーム状態(昨晩の占い結果など)を更新する。
         """
+        # 毎朝リセットする情報251107
+        self.talk_turn = 0
+        self.vote_declarations = {}
+        
+        # 毎朝リセット *しない* 情報 (CO、占い結果)251107
+        # self.seer_co_agents 
+        # self.divined_as_black
+        # self.divined_as_white
+        
+        self.agent_logger.logger.info(f"{self.info.day}日目の朝になりました。")
+        
+        # 議論開始前に、昨晩の結果や、(あれば)0日目のCOなどを解析251107
+        self._update_game_state()
+
+
+    # --- ★追加★ 議論解析用のヘルパー関数 ---251107
+
+    def _update_game_state(self) -> None:
+        """発言履歴(talk_history)を解析し、ゲーム状態を更新する (全役職共通)."""
+        
+        # まだ読んでいない発言 (self.talk_turn 以降) をチェック
+        new_talks = self.talk_history[self.talk_turn:]
+        
+        for talk in new_talks:
+            # 自分の発言は解析しない (無限ループ防止)
+            if talk.agent == self.info.agent:
+                continue
+            
+            text = talk.text
+            parts = text.split() # テキストを単語に分割
+
+            # try-except で囲み、予期せぬ形式 (例: 空の発言) でもクラッシュしないようにする
+            try:
+                # 0番目の単語（発言タイプ）が存在しない場合はスキップ
+                if not parts:
+                    continue
+
+                command = parts[0] # "VOTE", "DIVINED", "COMINGOUT" など
+
+                # (1) 占い師CO: "COMINGOUT Agent[01] SEER" (※Agent[01]は発言者自身)
+                # Note: COMINGOUT の発言者は talk.agent_name
+                # "ミヅキ" が "COMINGOUT ミヅキ SEER" と言った場合、
+                # talk.agent_name は "ミヅキ"
+                if command == "COMINGOUT" and len(parts) >= 3 and parts[-1] == "SEER":
+                    # ▼▼▼ 修正箇所 ▼▼▼
+                    # ログ出力する前にリストに追加
+                    self.seer_co_agents.add(talk.agent) 
+                    # リストの内容もログに出力
+                    self.agent_logger.logger.info(f"解析: {talk.agent} が SEER CO を記録。現在リスト: {self.seer_co_agents}")
+                    # ▲▲▲ 修正箇所 ▲▲▲
+                
+                # (2) 占い結果: "DIVINED セルヴァス WEREWOLF" or "DIVINED セルヴァス HUMAN"
+                elif command == "DIVINED" and len(parts) == 3:
+                    target = parts[1] # "セルヴァス"
+                    result_str = parts[2] # "WEREWOLF" or "HUMAN"
+                    
+                    if result_str == "WEREWOLF":
+                        result_role = Role.WEREWOLF
+                        # ▼▼▼ 修正箇所 ▼▼▼
+                        self.divined_as_black.add(target)
+                        self.agent_logger.logger.info(f"解析: {target} が黒判定 (発言者: {talk.agent})。現在リスト: {self.divined_as_black}")
+                        # ▲▲▲ 修正箇所 ▲▲▲
+                    elif result_str == "HUMAN":
+                        result_role = Species.HUMAN
+                        # ▼▼▼ 修正箇所 ▼▼▼
+                        self.divined_as_white.add(target)
+                        self.agent_logger.logger.info(f"解析: {target} が白判定 (発言者: {talk.agent})。現在リスト: {self.divined_as_white}")
+                        # ▲▲▲ 修正箇所 ▲▲▲
+                    else:
+                        continue # 不明な結果
+                    
+                    # 詳細リストに追加
+                    self.divined_reports.append((talk.agent, target, result_role))
+
+                # (3) 投票宣言: "VOTE セルヴァス"
+                elif command == "VOTE" and len(parts) == 2:
+                    target = parts[1] # "セルヴァス"
+                    # ▼▼▼ 修正箇所 ▼▼▼
+                    self.vote_declarations[talk.agent] = target
+                    self.agent_logger.logger.info(f"解析: {talk.agent} が {target} へ投票宣言。現在リスト: {self.vote_declarations}")
+                    # ▲▲▲ 修正箇所 ▲▲▲
+
+                # (将来的に: 霊媒CO、霊媒結果などの解析もここに追加)
+
+            except IndexError:
+                # parts[1] などが存在しない場合 (不正な形式) は無視
+                self.agent_logger.logger.debug(f"解析不能な発言: {text}")
+            except Exception as e:
+                self.agent_logger.logger.warning(f"発言解析中に予期せぬエラー: {e} (Text: {text})")
+
+        # 既読位置を更新
+        self.talk_turn = len(self.talk_history)
 
     def whisper(self) -> str:
         """Return response to whisper request.
@@ -177,6 +317,8 @@ class Agent:
         Returns:
             str: Whisper message / 囁きメッセージ
         """
+        # ★注意: 人狼は _update_game_state ではなく、
+        # _update_whisper_state のような専用のものを将来的に作る必要がある
         return random.choice(self.comments)  # noqa: S311
 
     def talk(self) -> str:
@@ -187,16 +329,38 @@ class Agent:
         Returns:
             str: Talk message / 発言メッセージ
         """
-        # ★ここから追加★
+        # --- ★追加★ 発言する前に、最新の情報を解析する ---251107
+        self._update_game_state()
+        
+        # ▼▼▼ 推敲（Day 0 挨拶の復活）▼▼▼251107
         # self.info が None でないことを確認し、0日目かどうかを判定
         if self.info and self.info.day == 0:
-            # 0日目なら挨拶を返す
-            # (self.agent_name には "Agent[01]" のような名前が入っています)
-            return f"こんにちは！ {self.agent_name} です。よろしくお願いします。"
-        # ★ここまで追加★
+            # 0日目なら挨拶を返す (self.agent_name ではなく self.info.agent を使う)
+            return f"こんにちは！ {self.info.agent} です。よろしくお願いします。"
+        # ▲▲▲ 推敲 ▲▲▲
 
-        # 0日目以外は、これまで通りランダムな発言を返す
-        return random.choice(self.comments)  # noqa: S311
+        # ▼▼▼ 推敲（random.choice の安全化）▼▼▼251107
+        # 1日目以降: self.comments が空でないか確認
+        if self.comments:
+            return random.choice(self.comments)  # noqa: S311
+        
+        # ▼▼▼ 修正箇所（デバッグログの強化） ▼▼▼
+        # self.comments が空の場合のフォールバック
+        self.agent_logger.logger.warning("talk(): self.comments が空です！")
+        
+        # __init__ で失敗した可能性のあるパス情報を、ここで出力する
+        try:
+            file_path_str = str(self.config["path"]["random_talk"])
+            file_path = Path(file_path_str)
+            self.agent_logger.logger.error(f"talk(): ランダム発話ファイルが見つからないようです。")
+            self.agent_logger.logger.error(f"talk(): 実行パス: {Path.cwd()}")
+            self.agent_logger.logger.error(f"talk(): configで探したパス: {file_path_str}")
+            self.agent_logger.logger.error(f"talk(): 絶対パス: {file_path.absolute()}")
+        except Exception as e:
+            self.agent_logger.error(f"talk(): configのパス指定('path.random_talk')が間違っているようです: {e}")
+
+        return "Over"
+        # ▲▲▲ 修正箇所 ▲▲▲
 
     def daily_finish(self) -> None:
         """Perform processing for daily finish request.
@@ -232,7 +396,27 @@ class Agent:
         Returns:
             str: Agent name to vote / 投票対象のエージェント名
         """
-        return random.choice(self.get_alive_agents())  # noqa: S311
+        # --- ★追加★ 意思決定の前に、最新の情報を解析する ---251107
+        self._update_game_state()
+
+        # ▼▼▼ 修正箇所 ▼▼▼
+        # 生存者リストを取得
+        alive_agents = self.get_alive_agents()
+
+        # 自分以外の生存者リストを作成
+        candidates = [agent for agent in alive_agents if agent != self.info.agent]
+        
+        if candidates:
+            # 自分以外の候補がいればランダムに選ぶ
+            target = random.choice(candidates) # type: ignore
+            self.agent_logger.logger.info(f"自分以外の生存者 {candidates} から {target} に投票します。")
+            return target
+        
+        # もし自分しか生存者がいなければ (安全策)
+        self.agent_logger.logger.warning("投票候補が自分しかいません。")
+        return self.info.agent
+        # ▲▲▲ 修正箇所 ▲▲▲
+
 
     def attack(self) -> str:
         """Return response to attack request.
